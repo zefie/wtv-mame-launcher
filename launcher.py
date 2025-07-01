@@ -5,7 +5,28 @@ from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
 import socket
 import threading
- 
+
+
+# Mapping of machine codes to human-readable names
+MACHINE_NAMES = {
+    "wtv1bf0": "WebTV Classic (2MB)",
+    "wtv1bfe": "WebTV Classic (Prototype)",
+    "wtv1dev": "WebTV Classic Dev Box (4MB)",
+    "wtv1dv2": "WebTV Classic Dev Box (2MB)",
+    "wtv1pal": "WebTV Classic (PAL)",
+
+    "wtv2drb": "WebTV Plus (Derby)",
+    "wtv2lc2": "WebTV Plus (LC2)",
+    "wtv2esr": "WebTV Echostar",
+    "wtv2jpc": "WebTV Classic (Japan)",
+    "wtv2jpp": "WebTV Plus (Japan)",
+    "wtv2ncl": "WebTV New Classic (BPS, 8MB)",
+    "wtv2npl": "WebTV New Plus (16MB)",
+    "wtv2utv": "Ultimate TV",
+    "wtv2uvd": "Ultimate TV Dev Box",
+    "wtv2wld": "WebTV Plus Italian Prototype"
+}
+
 class MameWorker(QThread):
     def __init__(self, command, parent=None):
         super().__init__(parent)
@@ -60,10 +81,19 @@ class MainWindow(QMainWindow):
         pattern = r'\((wtv[^)]+)\)'
         data = subprocess.run([self.executable, '-listbios'], capture_output=True, text=True)
         matches = re.findall(pattern, data.stdout)
-        self.dropdown.addItems(matches)
+        # For each match, check MACHINE_NAMES for a friendly description
+        items = []
+        for m in matches:
+            desc = MACHINE_NAMES.get(m, "")
+            if desc:
+                items.append(f"{m} - {desc}")
+            else:
+                items.append(m)
+        self.dropdown.addItems(items)
         top_layout = QHBoxLayout()
         top_layout.setSizeConstraint(QLayout.SetFixedSize)
-        top_layout.addWidget(QLabel("Select an option:"))
+        sel_opt = QLabel("Select Machine:")
+        top_layout.addWidget(sel_opt)
         ssid_static = QLabel("SSID:")
         ssid_static.setAlignment(Qt.AlignRight)
         top_layout.addWidget(ssid_static)
@@ -115,6 +145,8 @@ class MainWindow(QMainWindow):
         self.button.clicked.connect(self.on_button_click)
         self.modem.clicked.connect(self.on_modem_click)
         layout.addWidget(self.button)
+        self.setMinimumWidth(510)
+        self.setMinimumHeight(375)
         # Multiline Text Area
         self.text_area = QTextEdit()
         self.text_area.setReadOnly(True)
@@ -128,17 +160,25 @@ class MainWindow(QMainWindow):
         self.single_line_input.returnPressed.connect(self.send_button.click)
         layout.addLayout(input_layout)
         main_widget.setLayout(layout)
-        self.text_area.setMinimumHeight(250)
-        self.text_area.setMinimumWidth(400)
         self.text_area.setVisible(self.serialdbg.isChecked())
         self.text_area.setStyleSheet("font-family: monospace; font-size: 8pt;")
         self.text_area.setLineWrapMode(QTextEdit.NoWrap)
         self.text_area.setPlaceholderText("Serial output will appear here...")
-        self.serialdbg.toggled.connect(self.text_area.setVisible)
+        self.serialdbg.toggled.connect(self.toggleSerialDebug)
         self.append_text_signal.connect(self.handle_serial_data)
         self.text_area.autoFormattingEnabled = False
-        self.serialdbg.toggled.connect(self.text_area.setVisible)
         self.load_settings()
+        self.readSSID()
+        self.on_dropdown_changed()
+
+    def getMachine(self):
+        return self.dropdown.currentText().split(' ')[0]
+
+    def toggleSerialDebug(self, checked):
+        self.text_area.setEnabled(checked)
+        self.single_line_input.setEnabled(checked)
+        self.send_button.setEnabled(checked)
+
 
     def send_serial_data(self, data):
         self.single_line_input.clear()
@@ -267,12 +307,15 @@ class MainWindow(QMainWindow):
         """
         
     def getMachineSSID(self, machine):
-        filename = "roms/" + machine + "/ds2401.bin"
-        with open(filename, "rb") as file:
-            data = file.read()
-            hex_str = data.hex()
-            return hex_str
-                
+        try:
+            filename = "roms/" + machine + "/ds2401.bin"
+            with open(filename, "rb") as file:
+                data = file.read()
+                hex_str = data.hex()
+                return hex_str
+        except FileNotFoundError:
+            return "No SSID"
+
     def setMachineSSID(self, machine, ssid):
         filepath = "roms/" + machine
         filename = filepath + "/ds2401.bin"
@@ -282,12 +325,12 @@ class MainWindow(QMainWindow):
             file.write(data)   
 
     def createSSID(self):
-        machine = self.dropdown.currentText()
+        machine = self.getMachine()
         self.setMachineSSID(machine, self.generate_ssid(True))
         self.readSSID()
         
     def readSSID(self):
-        machine = self.dropdown.currentText()
+        machine = self.getMachine()
         try:
             self.ssid_label.setText(self.getMachineSSID(machine))
         except:
@@ -354,11 +397,11 @@ class MainWindow(QMainWindow):
 
     def show_about_dialog(self):
         """Displays an About dialog"""
-        QMessageBox.information(self, "About", "WebTV MAME Launcher\nVersion 1.0\nCreated with PyQt5")
+        QMessageBox.information(self, "About", "WebTV MAME Launcher\nVersion 1.1\nCreated by zefie with PyQt5")
 
     def save_settings(self):
         """Save settings before closing"""
-        self.settings.setValue("dropdown", self.dropdown.currentText())
+        self.settings.setValue("dropdownIndex", self.dropdown.currentIndex())
         self.settings.setValue("verbose", self.verbose.isChecked())
         self.settings.setValue("window", self.windowed.isChecked())
         self.settings.setValue("modem", self.modem.isChecked())
@@ -370,7 +413,7 @@ class MainWindow(QMainWindow):
 
     def load_settings(self):
         """Load settings on startup"""
-        self.dropdown.setCurrentText(self.settings.value("dropdown", "wtv1sony"))
+        self.dropdown.setCurrentIndex(self.settings.value("dropdownIndex", 0, type=int))
         self.verbose.setChecked(self.settings.value("verbose", True, type=bool))
         self.windowed.setChecked(self.settings.value("window", True, type=bool))
         self.modem.setChecked(self.settings.value("modem", True, type=bool))
@@ -382,15 +425,15 @@ class MainWindow(QMainWindow):
 
     def on_dropdown_changed(self):
         self.readSSID()
-        if self.dropdown.currentText()[3] == "1":
+        if self.getMachine()[3] == "1":
             self.diskboot.hide()
             self.disklab.hide()
             self.disk.hide()
-        elif (self.dropdown.currentText()[3] == "2" and (self.dropdown.currentText()[4] == "n" or self.dropdown.currentText()[4] == "w")):
+        elif (self.getMachine()[3] == "2" and (self.getMachine()[4] == "n" or self.getMachine()[4] == "w")):
             self.diskboot.show()
             self.disklab.hide()
             self.disk.hide()
-        elif self.dropdown.currentText()[3] == "2" and (self.dropdown.currentText()[4] != "n" and self.dropdown.currentText()[4] != "w"):
+        elif self.getMachine()[3] == "2" and (self.getMachine()[4] != "n" and self.getMachine()[4] != "w"):
             self.diskboot.show()
             self.disklab.show()
             self.disk.show()
@@ -405,7 +448,7 @@ class MainWindow(QMainWindow):
             
     def on_button_click(self):
         self.text_area.clear()
-        selected = self.dropdown.currentText()
+        selected = self.getMachine()
         command = [self.executable, selected]
         command += ["-nomouse"]
         if self.verbose.isChecked():
@@ -432,8 +475,12 @@ class MainWindow(QMainWindow):
         worker = MameWorker(command)
         worker.start()
         # Soft loop: process events while the worker thread is running
+        self.button.setEnabled(False)
+        self.button.setText("Running...")
         while worker.isRunning():
             QApplication.processEvents(QEventLoop.AllEvents, 100)
+        self.button.setEnabled(True)
+        self.button.setText("Launch MAME")
 
     def start_socket_server(self):
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
