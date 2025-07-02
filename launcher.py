@@ -3,8 +3,10 @@ if sys.platform.startswith('win'):
     import winreg
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
-import socket
+from PyQt5.QtGui import *
+import socket, time
 import threading
+import win32gui, win32process, win32con
 
 
 # Mapping of machine codes to human-readable names
@@ -28,19 +30,65 @@ MACHINE_NAMES = {
 }
 
 class MameWorker(QThread):
+    window_found = pyqtSignal(int)  # Signal to send back the HWND
+
     def __init__(self, command, parent=None):
         super().__init__(parent)
         self.command = command
+        self.mame_hwnd = None
+        self.process = None
+        self._should_stop = False
 
     def run(self):
-        subprocess.run(self.command)
+        # Launch MAME process
+        self.process = subprocess.Popen(self.command)
+        pid = self.process.pid
 
-def run_mame(command):
-    worker = MameWorker(command)
-    worker.start()
+        # Try to find the MAME window
+        for _ in range(30):  # Try for ~3 seconds
+            hwnd = self._find_window_by_pid(pid)
+            if hwnd:
+                self.mame_hwnd = hwnd
+                self.window_found.emit(hwnd)
+                break
+            time.sleep(0.1)
+
+        self.process.wait()
+
+    def stop(self):
+        self._should_stop = True
+        if self.process and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+
+    def _find_window_by_pid(self, target_pid):
+        def callback(hwnd, pid_list):
+            if win32gui.IsWindowVisible(hwnd) and win32gui.IsWindowEnabled(hwnd):
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                if pid == target_pid:
+                    pid_list.append(hwnd)
+        hwnds = []
+        win32gui.EnumWindows(callback, hwnds)
+        return hwnds[0] if hwnds else None
+
+    def send_key(self, vk_code):
+        ctypes.windll.user32.SetForegroundWindow(self.mame_hwnd)
+        # Send key down
+        win32gui.PostMessage(self.mame_hwnd, win32con.WM_KEYDOWN, vk_code, 0)
+        time.sleep(0.05)  # hold briefly
+        # Send key up
+        win32gui.PostMessage(self.mame_hwnd, win32con.WM_KEYUP, vk_code, 0)
 
 class MainWindow(QMainWindow):
     append_text_signal = pyqtSignal(str)
+
+    def closeEvent(self, event):
+        if self.worker:
+            self.worker.stop()
+        super().closeEvent(event)  # Ensure default cleanup continues
 
     def __init__(self):
         super().__init__()
@@ -108,10 +156,8 @@ class MainWindow(QMainWindow):
         self.mamedebug = QCheckBox("MAME Debugger")
         self.serialdbg = QCheckBox("Serial Debug")
         self.diskboot = QCheckBox("Disk Boot")
-        self.windowed = QCheckBox("Window Mode")
         self.modem = QCheckBox("Modem")
         self.verbose.setChecked(True)
-        self.windowed.setChecked(True)
         self.modem.setChecked(True)
         self.mamedebug.setChecked(False)
         self.serialdbg.setChecked(True)
@@ -121,7 +167,6 @@ class MainWindow(QMainWindow):
         checkboxes_layout.addWidget(self.verbose)
         checkboxes_layout.addWidget(self.mamedebug)
         checkboxes_layout.addWidget(self.serialdbg)
-        checkboxes_layout.addWidget(self.windowed)
         checkboxes_layout.addWidget(self.diskboot)
         checkboxes_layout.addWidget(self.modem)
         bitb_layout = QHBoxLayout()
@@ -145,12 +190,20 @@ class MainWindow(QMainWindow):
         self.button.clicked.connect(self.on_button_click)
         self.modem.clicked.connect(self.on_modem_click)
         layout.addWidget(self.button)
-        self.setMinimumWidth(510)
-        self.setMinimumHeight(375)
+        self.setMinimumWidth(1280)
+        self.setMinimumHeight(1024)
         # Multiline Text Area
         self.text_area = QTextEdit()
         self.text_area.setReadOnly(True)
-        layout.addWidget(self.text_area)
+        hbox = QHBoxLayout()
+        self.mame_window = QWidget();
+        self.mame_window.setMinimumHeight(768)
+        self.mame_window.setMinimumWidth(1024)
+        self.mame_window.setFocusPolicy(Qt.ClickFocus)
+        self.mame_window.mousePressEvent = lambda event: self.mame_window.setFocus()
+        hbox.addWidget(self.mame_window)
+        hbox.addWidget(self.text_area)
+        layout.addLayout(hbox)
         input_layout = QHBoxLayout()
         self.single_line_input = QLineEdit()
         self.send_button = QPushButton("Send")
@@ -162,13 +215,12 @@ class MainWindow(QMainWindow):
         main_widget.setLayout(layout)
         self.text_area.setVisible(self.serialdbg.isChecked())
         self.text_area.setStyleSheet("font-family: monospace; font-size: 8pt;")
-        self.text_area.setLineWrapMode(QTextEdit.NoWrap)
+        #self.text_area.setLineWrapMode(QTextEdit.NoWrap)
         self.text_area.setPlaceholderText("Serial output will appear here...")
         self.serialdbg.toggled.connect(self.toggleSerialDebug)
         self.append_text_signal.connect(self.handle_serial_data)
         self.text_area.autoFormattingEnabled = False
         self.load_settings()
-        self.readSSID()
         self.on_dropdown_changed()
 
     def getMachine(self):
@@ -178,7 +230,6 @@ class MainWindow(QMainWindow):
         self.text_area.setEnabled(checked)
         self.single_line_input.setEnabled(checked)
         self.send_button.setEnabled(checked)
-
 
     def send_serial_data(self, data):
         self.single_line_input.clear()
@@ -368,11 +419,37 @@ class MainWindow(QMainWindow):
         save_action.triggered.connect(self.save_settings)
         settings_menu.addAction(save_action)
 
+        # PO Codes Menu
+        po_menu = menubar.addMenu("PO Codes")
+        po_action = QAction("411 - Technical Info", self)
+        po_menu.addAction(po_action)
+        po_action.triggered.connect(self.send_po_411)
+
+
         # Help Menu
         help_menu = menubar.addMenu("Help")
         about_action = QAction("About", self)
         about_action.triggered.connect(self.show_about_dialog)
         help_menu.addAction(about_action)
+
+
+    def isMAMERunning(self):
+        """Check if MAME is currently running"""
+        if hasattr(self, 'worker') and self.worker and self.worker.isRunning():
+            return True
+        return False
+
+    def send_po_411(self):
+        if self.isMAMERunning():
+            # Send the PO code 411 to MAME
+            self.worker.send_key(0x7A) # 'F11/Options' key
+            self.worker.send_key(0x7A) # 'F11/Options' key
+            self.worker.send_key(0x34) # '4' key
+            self.worker.send_key(0x31) # '1' key
+            self.worker.send_key(0x31) # '1' key
+        else:
+            QMessageBox.warning(self, "Warning", "MAME is not running. Please launch MAME first.")
+
 
     def create_disk_image(self):
         """Opens a save dialog and creates a 1GB empty disk image"""
@@ -403,7 +480,6 @@ class MainWindow(QMainWindow):
         """Save settings before closing"""
         self.settings.setValue("dropdownIndex", self.dropdown.currentIndex())
         self.settings.setValue("verbose", self.verbose.isChecked())
-        self.settings.setValue("window", self.windowed.isChecked())
         self.settings.setValue("modem", self.modem.isChecked())
         self.settings.setValue("mamedebug", self.mamedebug.isChecked())
         self.settings.setValue("serialdbg", self.serialdbg.isChecked())
@@ -415,7 +491,6 @@ class MainWindow(QMainWindow):
         """Load settings on startup"""
         self.dropdown.setCurrentIndex(self.settings.value("dropdownIndex", 0, type=int))
         self.verbose.setChecked(self.settings.value("verbose", True, type=bool))
-        self.windowed.setChecked(self.settings.value("window", True, type=bool))
         self.modem.setChecked(self.settings.value("modem", True, type=bool))
         self.mamedebug.setChecked(self.settings.value("mamedebug", False, type=bool))
         self.serialdbg.setChecked(self.settings.value("serialdbg", True, type=bool))
@@ -445,18 +520,50 @@ class MainWindow(QMainWindow):
         else:
             self.bitblab.hide()
             self.bitb.hide()
-            
+
+    def stop_mame(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+            self.worker.wait()
+        self.button.setText("Launch MAME")
+        self.button.clicked.disconnect()
+        self.button.clicked.connect(self.on_button_click)
+
+    def embed_window(self, hwnd):
+        """
+        Reparent the MAME window to self.mame_window directly using Win32 APIs.
+        """
+        parent_hwnd = int(self.mame_window.winId())
+
+        # Reparent MAME window to our QWidget
+        win32gui.SetParent(hwnd, parent_hwnd)
+
+        # Optional: remove window border/style
+        style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
+        style = style & ~win32con.WS_CAPTION & ~win32con.WS_THICKFRAME
+        win32gui.SetWindowLong(hwnd, win32con.GWL_STYLE, style)
+
+        # Resize MAME window to fill self.mame_window
+        rect = self.mame_window.rect()
+        win32gui.SetWindowPos(
+            hwnd, None,
+            0, 0, rect.width(), rect.height(),
+            win32con.SWP_NOZORDER | win32con.SWP_SHOWWINDOW
+        )
+
+        # Ensure MAME gets input
+        ctypes.windll.user32.SetForegroundWindow(hwnd)
+
     def on_button_click(self):
         self.text_area.clear()
         selected = self.getMachine()
         command = [self.executable, selected]
         command += ["-nomouse"]
+        command += ["-nomax", "-window"]        
         if self.verbose.isChecked():
             command += ["-verbose"]
         if self.mamedebug.isChecked():
             command += ["-debug"]
-        if self.windowed.isChecked():
-            command += ["-nomax", "-window"]
         if self.modem.isChecked():
             if selected[3] == "1":
                 command += ["-spot:modem"]
@@ -469,17 +576,21 @@ class MainWindow(QMainWindow):
         if self.serialdbg.isChecked():
             command += ["-bitb2", "socket.127.0.0.1:3344"]
             self.start_socket_server()
+        command += ["-skip_gameinfo"]
+        command += ["-video", "bgfx"]
+        command += ["-keyboardprovider", "win32"]
         self.save_settings()
         print(f"{command}")
         # Run the command in another thread to avoid blocking the UI
-        worker = MameWorker(command)
-        worker.start()
+        self.worker = MameWorker(command)
+        self.worker.window_found.connect(self.embed_window)
+        self.worker.start()
         # Soft loop: process events while the worker thread is running
-        self.button.setEnabled(False)
-        self.button.setText("Running...")
-        while worker.isRunning():
+        self.button.setText("Stop MAME")
+        self.button.clicked.disconnect()
+        self.button.clicked.connect(self.stop_mame)
+        while self.worker.isRunning():
             QApplication.processEvents(QEventLoop.AllEvents, 100)
-        self.button.setEnabled(True)
         self.button.setText("Launch MAME")
 
     def start_socket_server(self):
@@ -498,7 +609,10 @@ class MainWindow(QMainWindow):
                     # Optionally, display data in the text area using signal
                     self.append_text_signal.emit(data.decode(errors='replace'))
             except Exception as e:
-                self.append_text_signal.emit(f"Socket error: {e}")
+                if "forcibly closed" in str(e):
+                    # this is expected if the client disconnects
+                    return
+                print(f"Socket error: {e}")
             finally:
                 server.close()
         threading.Thread(target=handle_client, daemon=True).start()
