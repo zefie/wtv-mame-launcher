@@ -1,12 +1,10 @@
 import sys, os, re, subprocess, ctypes, shutil, random
-if sys.platform.startswith('win'):
-    import winreg
+import winreg, win32gui, win32process, win32con, win32pipe, win32file, pywintypes
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
 from PyQt5.QtGui import *
 import socket, time
 import threading
-import win32gui, win32process, win32con
 
 
 # Mapping of machine codes to human-readable names
@@ -25,8 +23,8 @@ MACHINE_NAMES = {
     "wtv2ncl": "WebTV New Classic (BPS, 8MB)",
     "wtv2npl": "WebTV New Plus (16MB)",
     "wtv2utv": "Ultimate TV",
-    "wtv2uvd": "Ultimate TV Dev Box",
-    "wtv2wld": "WebTV Plus Italian Prototype"
+    "wtv2uvd": "Ultimate TV Dev Box (Fake)",
+    "wtv2wld": "WebTV Italian Prototype"
 }
 
 class MameWorker(QThread):
@@ -74,20 +72,29 @@ class MameWorker(QThread):
         win32gui.EnumWindows(callback, hwnds)
         return hwnds[0] if hwnds else None
 
-    def send_key(self, vk_code):
-        ctypes.windll.user32.SetForegroundWindow(self.mame_hwnd)
-        # Send key down
-        win32gui.PostMessage(self.mame_hwnd, win32con.WM_KEYDOWN, vk_code, 0)
-        time.sleep(0.05)  # hold briefly
-        # Send key up
-        win32gui.PostMessage(self.mame_hwnd, win32con.WM_KEYUP, vk_code, 0)
+    def send_key(self, key):
+        try:
+            pipe = win32pipe.CreateNamedPipe(
+                r'\\.\pipe\mame_input',
+                win32pipe.PIPE_ACCESS_OUTBOUND,
+                win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_WAIT,
+                1, 65536, 65536,
+                0,
+                None
+            )
+            win32pipe.ConnectNamedPipe(pipe, None)
+            win32file.WriteFile(pipe, (key + "\n").encode())
+            win32pipe.DisconnectNamedPipe(pipe)
+        except pywintypes.error as e:
+            print("Pipe closed or failed:", e)
+            win32file.CloseHandle(pipe)
 
 class MainWindow(QMainWindow):
     append_text_signal = pyqtSignal(str)
 
     def closeEvent(self, event):
         if self.worker:
-            self.worker.stop()
+            self.stop_mame()
         super().closeEvent(event)  # Ensure default cleanup continues
 
     def __init__(self):
@@ -96,8 +103,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("WebTV MAME Launcher")
         self.setGeometry(100, 100, 400, 100)
  
-        if sys.platform.startswith('win'):
-            self.apply_dark_mode()
+        self.apply_dark_mode()
 
         # Create the Menu Bar
         self.create_menu_bar()
@@ -191,16 +197,16 @@ class MainWindow(QMainWindow):
         self.modem.clicked.connect(self.on_modem_click)
         layout.addWidget(self.button)
         self.setMinimumWidth(1280)
-        self.setMinimumHeight(1024)
+        self.setMinimumHeight(792)
         # Multiline Text Area
         self.text_area = QTextEdit()
         self.text_area.setReadOnly(True)
         hbox = QHBoxLayout()
         self.mame_window = QWidget();
-        self.mame_window.setMinimumHeight(768)
-        self.mame_window.setMinimumWidth(1024)
+        self.mame_window.setFixedSize(800, 600)
         self.mame_window.setFocusPolicy(Qt.ClickFocus)
         self.mame_window.mousePressEvent = lambda event: self.mame_window.setFocus()
+        self.mame_window.setStyleSheet("background-color: black; border: 1px solid #555;")
         hbox.addWidget(self.mame_window)
         hbox.addWidget(self.text_area)
         layout.addLayout(hbox)
@@ -424,7 +430,12 @@ class MainWindow(QMainWindow):
         po_action = QAction("411 - Technical Info", self)
         po_menu.addAction(po_action)
         po_action.triggered.connect(self.send_po_411)
-
+        po_action = QAction("93288 - Connect Setup", self)
+        po_action.triggered.connect(self.send_po_93288)
+        po_menu.addAction(po_action)
+        po_action = QAction("8675309 - Minibrowser", self)
+        po_action.triggered.connect(self.send_po_8675309)
+        po_menu.addAction(po_action)
 
         # Help Menu
         help_menu = menubar.addMenu("Help")
@@ -439,14 +450,42 @@ class MainWindow(QMainWindow):
             return True
         return False
 
+
+    def send_po_preamble(self):
+        if self.isMAMERunning():
+            self.worker.send_key('{F11}')
+            self.worker.send_key('{F11}')
+
     def send_po_411(self):
         if self.isMAMERunning():
-            # Send the PO code 411 to MAME
-            self.worker.send_key(0x7A) # 'F11/Options' key
-            self.worker.send_key(0x7A) # 'F11/Options' key
-            self.worker.send_key(0x34) # '4' key
-            self.worker.send_key(0x31) # '1' key
-            self.worker.send_key(0x31) # '1' key
+            self.send_po_preamble()
+            self.worker.send_key("4")
+            self.worker.send_key("1")
+            self.worker.send_key("1")
+        else:
+            QMessageBox.warning(self, "Warning", "MAME is not running. Please launch MAME first.")
+
+    def send_po_8675309(self):
+        if self.isMAMERunning():
+            self.send_po_preamble()
+            self.worker.send_key("8")
+            self.worker.send_key("6")
+            self.worker.send_key("7")
+            self.worker.send_key("5")
+            self.worker.send_key("3")
+            self.worker.send_key("0")
+            self.worker.send_key("9")
+        else:
+            QMessageBox.warning(self, "Warning", "MAME is not running. Please launch MAME first.")
+
+    def send_po_93288(self):
+        if self.isMAMERunning():
+            self.send_po_preamble()
+            self.worker.send_key("9")
+            self.worker.send_key("3")
+            self.worker.send_key("2")
+            self.worker.send_key("8")
+            self.worker.send_key("8")
         else:
             QMessageBox.warning(self, "Warning", "MAME is not running. Please launch MAME first.")
 
@@ -558,8 +597,7 @@ class MainWindow(QMainWindow):
         self.text_area.clear()
         selected = self.getMachine()
         command = [self.executable, selected]
-        command += ["-nomouse"]
-        command += ["-nomax", "-window"]        
+        command += ["-nomouse", "-nomax", "-window"]        
         if self.verbose.isChecked():
             command += ["-verbose"]
         if self.mamedebug.isChecked():
@@ -577,8 +615,9 @@ class MainWindow(QMainWindow):
             command += ["-bitb2", "socket.127.0.0.1:3344"]
             self.start_socket_server()
         command += ["-skip_gameinfo"]
-        command += ["-video", "bgfx"]
+        command += ["-video", "sdl"]
         command += ["-keyboardprovider", "win32"]
+        command += ["-autoboot_script", "mame_input_pipe.lua"]
         self.save_settings()
         print(f"{command}")
         # Run the command in another thread to avoid blocking the UI
@@ -592,7 +631,10 @@ class MainWindow(QMainWindow):
         while self.worker.isRunning():
             QApplication.processEvents(QEventLoop.AllEvents, 100)
         self.button.setText("Launch MAME")
-
+        self.button.clicked.disconnect()
+        self.button.clicked.connect(self.on_button_click)
+        self.mame_window.repaint()
+                                    
     def start_socket_server(self):
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
