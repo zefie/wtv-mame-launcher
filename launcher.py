@@ -459,33 +459,21 @@ class MainWindow(QMainWindow):
     def send_po_411(self):
         if self.isMAMERunning():
             self.send_po_preamble()
-            self.worker.send_key("4")
-            self.worker.send_key("1")
-            self.worker.send_key("1")
+            self.worker.send_key("411")
         else:
             QMessageBox.warning(self, "Warning", "MAME is not running. Please launch MAME first.")
 
     def send_po_8675309(self):
         if self.isMAMERunning():
             self.send_po_preamble()
-            self.worker.send_key("8")
-            self.worker.send_key("6")
-            self.worker.send_key("7")
-            self.worker.send_key("5")
-            self.worker.send_key("3")
-            self.worker.send_key("0")
-            self.worker.send_key("9")
+            self.worker.send_key("8675309")
         else:
             QMessageBox.warning(self, "Warning", "MAME is not running. Please launch MAME first.")
 
     def send_po_93288(self):
         if self.isMAMERunning():
             self.send_po_preamble()
-            self.worker.send_key("9")
-            self.worker.send_key("3")
-            self.worker.send_key("2")
-            self.worker.send_key("8")
-            self.worker.send_key("8")
+            self.worker.send_key("93288")
         else:
             QMessageBox.warning(self, "Warning", "MAME is not running. Please launch MAME first.")
 
