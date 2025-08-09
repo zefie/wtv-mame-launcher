@@ -93,6 +93,7 @@ class MainWindow(QMainWindow):
     append_text_signal = pyqtSignal(str)
 
     def closeEvent(self, event):
+        self.stop_socket_server()
         if self.worker:
             self.stop_mame()
         super().closeEvent(event)  # Ensure default cleanup continues
@@ -102,6 +103,9 @@ class MainWindow(QMainWindow):
         self.diskpath = os.path.join(os.getcwd(), "disks")
         self.setWindowTitle("WebTV MAME Launcher")
         self.setGeometry(100, 100, 400, 100)
+        self.server_socket = None
+        self.conn = None
+        self.server_thread = None
  
         self.apply_dark_mode()
 
@@ -161,19 +165,17 @@ class MainWindow(QMainWindow):
         self.verbose = QCheckBox("Verbose")
         self.mamedebug = QCheckBox("MAME Debugger")
         self.serialdbg = QCheckBox("Serial Debug")
-        self.diskboot = QCheckBox("Disk Boot")
+        
         self.modem = QCheckBox("Modem")
         self.verbose.setChecked(True)
         self.modem.setChecked(True)
         self.mamedebug.setChecked(False)
         self.serialdbg.setChecked(True)
-        self.diskboot.setChecked(True)
         self.bitblab = QLabel("BITB:")
         self.bitb = QLineEdit("touchppp.lan.zef:1122");
         checkboxes_layout.addWidget(self.verbose)
         checkboxes_layout.addWidget(self.mamedebug)
         checkboxes_layout.addWidget(self.serialdbg)
-        checkboxes_layout.addWidget(self.diskboot)
         checkboxes_layout.addWidget(self.modem)
         bitb_layout = QHBoxLayout()
         bitb_layout.addWidget(self.bitblab)
@@ -261,28 +263,20 @@ class MainWindow(QMainWindow):
             cursor.movePosition(cursor.End)
             cursor.deletePreviousChar()
             data = data[:-1]
-        # Read the last 10 bytes of the text area and compare to "Disk Boot?"
-        last_text = self.text_area.toPlainText()
-        # Get the last line from the text area (after the last newline)
-        if '\n' in last_text:
-            last_line = last_text.rsplit('\n', 1)[-1]
-        else:
-            last_line = last_text
-        if "Disk Boot?" in last_text:
-            diskboot = "y\n" if self.diskboot.isChecked() else "n\n"
-            self.conn.sendall(diskboot.encode())
+            
         # Handle carriage return (byte 0x0D): move to the start of the line
         if data and (data[-1] == '\r' or data[-1] == chr(13)):
             # Remove the carriage return character
             data = data[:-1]
+            
         # Insert the data at the end of the text area
-        if not data:
-            return
-        cursor = self.text_area.textCursor()
-        cursor.movePosition(cursor.End)
-        cursor.insertText(data)
-        self.text_area.setTextCursor(cursor)
-
+        if data:
+            cursor = self.text_area.textCursor()
+            cursor.movePosition(cursor.End)
+            cursor.insertText(data)
+            self.text_area.setTextCursor(cursor)
+            
+     
     def get_ssid_crc(self, ssid):
         """
         Compute a 2-digit hexadecimal CRC for the SSID.
@@ -428,8 +422,11 @@ class MainWindow(QMainWindow):
         # PO Codes Menu
         po_menu = menubar.addMenu("PO Codes")
         po_action = QAction("411 - Technical Info", self)
-        po_menu.addAction(po_action)
         po_action.triggered.connect(self.send_po_411)
+        po_menu.addAction(po_action)
+        po_action = QAction("314159 - Ignore ROM Signature", self)
+        po_action.triggered.connect(self.send_po_314159)
+        po_menu.addAction(po_action)
         po_action = QAction("93288 - Connect Setup", self)
         po_action.triggered.connect(self.send_po_93288)
         po_menu.addAction(po_action)
@@ -460,6 +457,13 @@ class MainWindow(QMainWindow):
         if self.isMAMERunning():
             self.send_po_preamble()
             self.worker.send_key("411")
+        else:
+            QMessageBox.warning(self, "Warning", "MAME is not running. Please launch MAME first.")
+
+    def send_po_314159(self):
+        if self.isMAMERunning():
+            self.send_po_preamble()
+            self.worker.send_key("314159")
         else:
             QMessageBox.warning(self, "Warning", "MAME is not running. Please launch MAME first.")
 
@@ -510,7 +514,6 @@ class MainWindow(QMainWindow):
         self.settings.setValue("modem", self.modem.isChecked())
         self.settings.setValue("mamedebug", self.mamedebug.isChecked())
         self.settings.setValue("serialdbg", self.serialdbg.isChecked())
-        self.settings.setValue("diskboot", self.diskboot.isChecked())
         self.settings.setValue("bitb", self.bitb.text())
         self.settings.setValue("disk", self.disk.currentText())
 
@@ -522,21 +525,17 @@ class MainWindow(QMainWindow):
         self.mamedebug.setChecked(self.settings.value("mamedebug", False, type=bool))
         self.serialdbg.setChecked(self.settings.value("serialdbg", True, type=bool))
         self.bitb.setText(self.settings.value("bitb", "touchppp.lan.zef:1122"))
-        self.diskboot.setChecked(self.settings.value("diskboot", True, type=bool))
         self.disk.setCurrentText(self.settings.value("disk", ""))       
 
     def on_dropdown_changed(self):
         self.readSSID()
         if self.getMachine()[3] == "1":
-            self.diskboot.hide()
             self.disklab.hide()
             self.disk.hide()
         elif (self.getMachine()[3] == "2" and (self.getMachine()[4] == "n" or self.getMachine()[4] == "w")):
-            self.diskboot.show()
             self.disklab.hide()
             self.disk.hide()
         elif self.getMachine()[3] == "2" and (self.getMachine()[4] != "n" and self.getMachine()[4] != "w"):
-            self.diskboot.show()
             self.disklab.show()
             self.disk.show()
             
@@ -549,6 +548,7 @@ class MainWindow(QMainWindow):
             self.bitb.hide()
 
     def stop_mame(self):
+        self.stop_socket_server()
         if self.worker and self.worker.isRunning():
             self.worker.stop()
             self.worker.wait()
@@ -624,28 +624,80 @@ class MainWindow(QMainWindow):
         self.mame_window.repaint()
                                     
     def start_socket_server(self):
-        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind(('127.0.0.1', 3344))
-        server.listen(1)
-        # Accept one connection and keep it open
+        # Stop any existing server first
+        self.stop_socket_server()
+        
         def handle_client():
             try:
-                self.conn, _ = server.accept()
+                self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                self.server_socket.settimeout(1.0)  # Add timeout to prevent hanging
+                self.server_socket.bind(('127.0.0.1', 3344))
+                self.server_socket.listen(1)
+                
                 while True:
-                    data = self.conn.recv(1024)
-                    if not data:
-                        break
-                    # Optionally, display data in the text area using signal
-                    self.append_text_signal.emit(data.decode(errors='replace'))
+                    try:
+                        self.conn, addr = self.server_socket.accept()
+                        self.conn.settimeout(0.1)  # Non-blocking receive with short timeout
+                        
+                        while True:
+                            try:
+                                data = self.conn.recv(1024)
+                                if not data:
+                                    break
+                                # Display data in the text area using signal
+                                self.append_text_signal.emit(data.decode(errors='replace'))
+                            except socket.timeout:
+                                # Check if we should stop
+                                if not hasattr(self, 'server_socket') or self.server_socket is None:
+                                    break
+                                continue
+                            except (ConnectionResetError, ConnectionAbortedError, OSError):
+                                # Connection was closed by client
+                                break
+                                
+                    except socket.timeout:
+                        # Check if we should stop
+                        if not hasattr(self, 'server_socket') or self.server_socket is None:
+                            break
+                        continue
+                    except OSError as e:
+                        if e.errno == 10048:  # Address already in use
+                            self.append_text_signal.emit("Error: Port 3344 already in use. Try again.")
+                            break
+                        elif "forcibly closed" in str(e) or "connection" in str(e).lower():
+                            # Expected disconnection
+                            break
+                        else:
+                            print(f"Socket error: {e}")
+                            break
+                            
             except Exception as e:
-                if "forcibly closed" in str(e):
-                    # this is expected if the client disconnects
-                    return
-                print(f"Socket error: {e}")
+                self.append_text_signal.emit(f"Socket server error: {e}")
             finally:
-                server.close()
-        threading.Thread(target=handle_client, daemon=True).start()
+                self.stop_socket_server()
+                
+        self.server_thread = threading.Thread(target=handle_client, daemon=True)
+        self.server_thread.start()
+
+    def stop_socket_server(self):
+        """Properly close socket server and cleanup resources"""
+        if hasattr(self, 'conn') and self.conn:
+            try:
+                self.conn.close()
+            except:
+                pass
+            self.conn = None
+            
+        if hasattr(self, 'server_socket') and self.server_socket:
+            try:
+                self.server_socket.close()
+            except:
+                pass
+            self.server_socket = None
+            
+        if hasattr(self, 'server_thread') and self.server_thread and self.server_thread.is_alive():
+            self.server_thread.join(timeout=1.0)  # Wait up to 1 second for thread to finish
 
         
 if __name__ == "__main__":
