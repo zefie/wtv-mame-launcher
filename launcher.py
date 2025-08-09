@@ -106,6 +106,7 @@ class MainWindow(QMainWindow):
         self.server_socket = None
         self.conn = None
         self.server_thread = None
+
  
         self.apply_dark_mode()
 
@@ -165,7 +166,9 @@ class MainWindow(QMainWindow):
         self.verbose = QCheckBox("Verbose")
         self.mamedebug = QCheckBox("MAME Debugger")
         self.serialdbg = QCheckBox("Serial Debug")
-        
+        self.diskboot = QCheckBox("Disk Boot")
+        self.diskboot.setChecked(True)
+
         self.modem = QCheckBox("Modem")
         self.verbose.setChecked(True)
         self.modem.setChecked(True)
@@ -177,6 +180,7 @@ class MainWindow(QMainWindow):
         checkboxes_layout.addWidget(self.mamedebug)
         checkboxes_layout.addWidget(self.serialdbg)
         checkboxes_layout.addWidget(self.modem)
+        checkboxes_layout.addWidget(self.diskboot)
         bitb_layout = QHBoxLayout()
         bitb_layout.addWidget(self.bitblab)
         bitb_layout.addWidget(self.bitb)
@@ -203,6 +207,8 @@ class MainWindow(QMainWindow):
         # Multiline Text Area
         self.text_area = QTextEdit()
         self.text_area.setReadOnly(True)
+        self.text_area.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.text_area.customContextMenuRequested.connect(self.show_text_area_context_menu)
         hbox = QHBoxLayout()
         self.mame_window = QWidget();
         self.mame_window.setFixedSize(800, 600)
@@ -231,6 +237,37 @@ class MainWindow(QMainWindow):
         self.load_settings()
         self.on_dropdown_changed()
 
+    def show_text_area_context_menu(self, position):
+        """Show context menu for the text area"""
+        context_menu = QMenu(self)
+        
+        clear_action = QAction("Clear Output", self)
+        clear_action.triggered.connect(self.text_area.clear)
+        context_menu.addAction(clear_action)
+        
+        copy_action = QAction("Copy All", self)
+        copy_action.triggered.connect(lambda: self.text_area.selectAll() or self.text_area.copy())
+        context_menu.addAction(copy_action)
+        
+        save_action = QAction("Save to File...", self)
+        save_action.triggered.connect(self.save_serial_output)
+        context_menu.addAction(save_action)
+        
+        context_menu.exec_(self.text_area.mapToGlobal(position))
+
+    def save_serial_output(self):
+        """Save serial output to a file"""
+        options = QFileDialog.Options()
+        file_name, _ = QFileDialog.getSaveFileName(self, "Save Serial Output", "serial_output.txt", "Text Files (*.txt);;All Files (*)", options=options)
+        
+        if file_name:
+            try:
+                with open(file_name, 'w', encoding='utf-8') as f:
+                    f.write(self.text_area.toPlainText())
+                QMessageBox.information(self, "Success", f"Serial output saved to:\n{file_name}")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to save file:\n{str(e)}")
+
     def getMachine(self):
         return self.dropdown.currentText().split(' ')[0]
 
@@ -258,6 +295,23 @@ class MainWindow(QMainWindow):
         # Handle backspace (byte 0x08): remove previous character
         cursor = self.text_area.textCursor()
         
+    def handle_serial_data(self, data):
+        """Append data to the text area."""
+        if isinstance(data, bytes):
+            data = data.decode(errors='replace')
+            
+        # Limit text area size to prevent memory issues with large amounts of data
+        current_text = self.text_area.toPlainText()
+        if len(current_text) > 100000:  # If more than 100k characters
+            # Keep only the last 50k characters
+            lines = current_text.split('\n')
+            # Keep approximately last half of the lines
+            keep_lines = lines[len(lines)//2:]
+            self.text_area.setPlainText('\n'.join(keep_lines))
+            
+        # Handle backspace (byte 0x08): remove previous character
+        cursor = self.text_area.textCursor()
+        
         if data and (data[-1] == '\x08' or  data[-1] == chr(8)):
             # Remove the last character in the text area
             cursor.movePosition(cursor.End)
@@ -276,7 +330,20 @@ class MainWindow(QMainWindow):
             cursor.insertText(data)
             self.text_area.setTextCursor(cursor)
             
-     
+            # Auto-scroll to bottom to show latest data
+            scrollbar = self.text_area.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
+            
+        # Check for "Disk Boot?" prompt after updating display
+        last_text = self.text_area.toPlainText()
+        if "Disk Boot?" in last_text and hasattr(self, 'conn') and self.conn and self.diskboot.isChecked():
+            try:
+                diskboot = "y\n" if self.diskboot.isChecked() else "n\n"
+                self.conn.sendall(diskboot.encode())
+                self.text_area.clear()
+            except Exception as e:
+                self.append_text_signal.emit(f"Auto-response error: {e}")
+
     def get_ssid_crc(self, ssid):
         """
         Compute a 2-digit hexadecimal CRC for the SSID.
@@ -525,6 +592,7 @@ class MainWindow(QMainWindow):
         self.mamedebug.setChecked(self.settings.value("mamedebug", False, type=bool))
         self.serialdbg.setChecked(self.settings.value("serialdbg", True, type=bool))
         self.bitb.setText(self.settings.value("bitb", "touchppp.lan.zef:1122"))
+        self.diskboot.setChecked(self.settings.value("diskboot", True, type=bool))
         self.disk.setCurrentText(self.settings.value("disk", ""))       
 
     def on_dropdown_changed(self):
@@ -631,6 +699,8 @@ class MainWindow(QMainWindow):
             try:
                 self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                # Increase socket buffer sizes for high-volume data
+                self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
                 self.server_socket.settimeout(1.0)  # Add timeout to prevent hanging
                 self.server_socket.bind(('127.0.0.1', 3344))
                 self.server_socket.listen(1)
@@ -638,16 +708,47 @@ class MainWindow(QMainWindow):
                 while True:
                     try:
                         self.conn, addr = self.server_socket.accept()
-                        self.conn.settimeout(0.1)  # Non-blocking receive with short timeout
+                        # Increase connection buffer and set TCP_NODELAY for faster transmission
+                        self.conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+                        self.conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                        self.conn.settimeout(0.05)  # Shorter timeout for more responsive flushing
+                        
+                        # Buffer for accumulating partial data
+                        data_buffer = b''
                         
                         while True:
                             try:
-                                data = self.conn.recv(1024)
-                                if not data:
+                                # Use larger buffer for high-volume data
+                                chunk = self.conn.recv(8192)
+                                if not chunk:
                                     break
-                                # Display data in the text area using signal
-                                self.append_text_signal.emit(data.decode(errors='replace'))
+                                    
+                                data_buffer += chunk
+                                
+                                # Process and emit data more aggressively for better responsiveness
+                                while data_buffer:
+                                    # Look for complete lines first
+                                    if b'\n' in data_buffer:
+                                        line, data_buffer = data_buffer.split(b'\n', 1)
+                                        # Include the newline in the output
+                                        complete_line = line + b'\n'
+                                        self.append_text_signal.emit(complete_line.decode(errors='replace'))
+                                    else:
+                                        # If no newline, emit data in smaller chunks for responsiveness
+                                        # But wait a bit to see if more data comes quickly
+                                        if len(data_buffer) > 256:  # Reduced threshold for faster response
+                                            # Emit partial data to keep display responsive
+                                            self.append_text_signal.emit(data_buffer.decode(errors='replace'))
+                                            data_buffer = b''
+                                        else:
+                                            # Small amount of data, break and wait for more or timeout
+                                            break
+                                    
                             except socket.timeout:
+                                # On timeout, flush any remaining buffered data immediately
+                                if data_buffer:
+                                    self.append_text_signal.emit(data_buffer.decode(errors='replace'))
+                                    data_buffer = b''
                                 # Check if we should stop
                                 if not hasattr(self, 'server_socket') or self.server_socket is None:
                                     break
@@ -655,6 +756,10 @@ class MainWindow(QMainWindow):
                             except (ConnectionResetError, ConnectionAbortedError, OSError):
                                 # Connection was closed by client
                                 break
+                        
+                        # Flush any remaining data when connection closes
+                        if data_buffer:
+                            self.append_text_signal.emit(data_buffer.decode(errors='replace'))
                                 
                     except socket.timeout:
                         # Check if we should stop
